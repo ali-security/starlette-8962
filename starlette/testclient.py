@@ -837,3 +837,6 @@ class TestClient(httpx.Client):
             )
             if message["type"] == "lifespan.shutdown.failed":
                 await receive()
+        # Ensure the corresponding receive stream is also closed to avoid
+        # unclosed stream warnings on Python 3.8.
+        await self.stream_receive.aclose()

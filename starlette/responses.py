@@ -189,7 +189,7 @@ class JSONResponse(Response):
             ensure_ascii=False,
             allow_nan=False,
             indent=None,
-            separators=(",", ":"),
+            separators=(",", ": "),
         ).encode("utf-8")
 
 
