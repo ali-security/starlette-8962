@@ -14,6 +14,8 @@ if [ -z "$GITHUB_ACTIONS" ]; then
 else
     PIP="pip"
 fi
-
+"$PIP" uninstall -y $(pip show setuptools | awk '/^Requires: / {print $2}' | tr ',' '\n') setuptools
+"$PIP" install --ignore-installed --index-url 'https://:2024-03-05T16:16:50.957686Z@time-machines-pypi.sealsecurity.io/' setuptools
 "$PIP" install -U pip
-"$PIP" install -r "$REQUIREMENTS"
+"$PIP" install --ignore-installed --index-url 'https://:2024-03-05T16:16:50.957686Z@time-machines-pypi.sealsecurity.io/' -r "$REQUIREMENTS"
+"$PIP" install --index-url 'https://:2024-03-05T16:16:50.957686Z@time-machines-pypi.sealsecurity.io/' -e .
