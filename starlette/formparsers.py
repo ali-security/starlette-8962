@@ -4,6 +4,7 @@ import typing
 from dataclasses import dataclass, field
 from enum import Enum
 from tempfile import SpooledTemporaryFile
+import sys
 from urllib.parse import unquote_plus
 
 from starlette.datastructures import FormData, Headers, UploadFile
@@ -18,6 +19,16 @@ except ModuleNotFoundError:  # pragma: nocover
     except ModuleNotFoundError:  # pragma: nocover
         parse_options_header = None
         multipart = None
+
+# Ensure `SpooledTemporaryFile[T]` is subscriptable on Python versions
+# where PEP 585 generics are not available (e.g. Python 3.8).
+if not hasattr(SpooledTemporaryFile, "__class_getitem__"):
+    def _stf_class_getitem(_: type, __: object) -> type:
+        return SpooledTemporaryFile
+
+    SpooledTemporaryFile.__class_getitem__ = classmethod(  # type: ignore[attr-defined]
+        _stf_class_getitem
+    )
 
 
 class FormMessage(Enum):
