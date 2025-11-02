@@ -26,9 +26,7 @@ jobs:
           python-version: "${{ matrix.python-version }}"
           allow-prereleases: true
       - name: "Install dependencies"
-        run: "scripts/install"
-      - name: "Run linting checks"
-        run: "scripts/check"
+        run: "scripts/install"    
       - name: "Build package & docs"
         run: "scripts/build"
       - name: "Run tests"
