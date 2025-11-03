@@ -4,16 +4,31 @@ import typing
 from dataclasses import dataclass, field
 from enum import Enum
 from tempfile import SpooledTemporaryFile
+import sys
 from urllib.parse import unquote_plus
 
 from starlette.datastructures import FormData, Headers, UploadFile
 
 try:
-    import multipart
-    from multipart.multipart import parse_options_header
+    import python_multipart as multipart  # type: ignore[import-not-found]
+    from python_multipart.multipart import parse_options_header  # type: ignore[import-not-found]
 except ModuleNotFoundError:  # pragma: nocover
-    parse_options_header = None
-    multipart = None
+    try:
+        import multipart  # type: ignore[import-not-found]
+        from multipart.multipart import parse_options_header  # type: ignore[import-not-found]
+    except ModuleNotFoundError:  # pragma: nocover
+        parse_options_header = None
+        multipart = None
+
+# Ensure `SpooledTemporaryFile[T]` is subscriptable on Python versions
+# where PEP 585 generics are not available (e.g. Python 3.8).
+if not hasattr(SpooledTemporaryFile, "__class_getitem__"):
+    def _stf_class_getitem(_: type, __: object) -> type:
+        return SpooledTemporaryFile
+
+    SpooledTemporaryFile.__class_getitem__ = classmethod(  # type: ignore[attr-defined]
+        _stf_class_getitem
+    )
 
 
 class FormMessage(Enum):
@@ -28,12 +43,12 @@ class FormMessage(Enum):
 class MultipartPart:
     content_disposition: bytes | None = None
     field_name: str = ""
-    data: bytes = b""
+    data: bytearray = field(default_factory=bytearray)
     file: UploadFile | None = None
     item_headers: list[tuple[bytes, bytes]] = field(default_factory=list)
 
 
-def _user_safe_decode(src: bytes, codec: str) -> str:
+def _user_safe_decode(src: bytes | bytearray, codec: str) -> str:
     try:
         return src.decode(codec)
     except (UnicodeDecodeError, LookupError):
@@ -118,7 +133,8 @@ class FormParser:
 
 
 class MultiPartParser:
-    max_file_size = 1024 * 1024
+    max_file_size = 1024 * 1024  # 1MB
+    max_part_size = 1024 * 1024  # 1MB
 
     def __init__(
         self,
@@ -152,7 +168,11 @@ class MultiPartParser:
     def on_part_data(self, data: bytes, start: int, end: int) -> None:
         message_bytes = data[start:end]
         if self._current_part.file is None:
-            self._current_part.data += message_bytes
+            if len(self._current_part.data) + len(message_bytes) > self.max_part_size:
+                raise MultiPartException(
+                    f"Part exceeded maximum size of {int(self.max_part_size / 1024)}KB."
+                )
+            self._current_part.data.extend(message_bytes)
         else:
             self._file_parts_to_write.append((self._current_part, message_bytes))
 

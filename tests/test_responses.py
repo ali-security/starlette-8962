@@ -570,3 +570,88 @@ async def test_streaming_response_stops_if_receiving_http_disconnect() -> None:
     with anyio.move_on_after(1) as cancel_scope:
         await response({}, receive_disconnect, send)
     assert not cancel_scope.cancel_called, "Content streaming should stop itself."
+
+
+def test_file_response_range_without_dash(
+    tmpdir: Path, test_client_factory: TestClientFactory
+) -> None:
+    # Content length 15
+    content = b"0123456789abcde"
+    path = os.path.join(tmpdir, "range.txt")
+    with open(path, "wb") as file:
+        file.write(content)
+
+    async def app(scope: Scope, receive: Receive, send: Send) -> None:
+        response = FileResponse(path=path, filename="range.txt")
+        await response(scope, receive, send)
+
+    client = test_client_factory(app)
+    # First item "100" is invalid (no dash) and should be ignored; second is valid
+    response = client.get("/", headers={"Range": "bytes=100, 0-4"})
+    assert response.status_code == 206
+    assert response.headers["content-range"] == f"bytes 0-4/{len(content)}"
+    assert response.headers["content-length"] == "5"
+    assert response.content == content[0:5]
+
+
+def test_file_response_range_empty_start_and_end(
+    tmpdir: Path, test_client_factory: TestClientFactory
+) -> None:
+    content = b"abcdefghij"
+    path = os.path.join(tmpdir, "range2.txt")
+    with open(path, "wb") as file:
+        file.write(content)
+
+    async def app(scope: Scope, receive: Receive, send: Send) -> None:
+        response = FileResponse(path=path, filename="range2.txt")
+        await response(scope, receive, send)
+
+    client = test_client_factory(app)
+    # The "-" entry should be ignored; the valid 0-4 should be used
+    response = client.get("/", headers={"Range": "bytes= - , 0-4"})
+    assert response.status_code == 206
+    assert response.headers["content-range"] == f"bytes 0-4/{len(content)}"
+    assert response.headers["content-length"] == "5"
+    assert response.content == content[0:5]
+
+
+def test_file_response_range_ignore_non_numeric(
+    tmpdir: Path, test_client_factory: TestClientFactory
+) -> None:
+    content = b"ABCDEFGHIJ"
+    path = os.path.join(tmpdir, "range3.txt")
+    with open(path, "wb") as file:
+        file.write(content)
+
+    async def app(scope: Scope, receive: Receive, send: Send) -> None:
+        response = FileResponse(path=path, filename="range3.txt")
+        await response(scope, receive, send)
+
+    client = test_client_factory(app)
+    # Non-numeric entry ignored; valid 2-6 used
+    response = client.get("/", headers={"Range": "bytes=abc-def, 2-6"})
+    assert response.status_code == 206
+    assert response.headers["content-range"] == f"bytes 2-6/{len(content)}"
+    assert response.headers["content-length"] == "5"
+    assert response.content == content[2:7]
+
+
+def test_file_response_suffix_range(
+    tmpdir: Path, test_client_factory: TestClientFactory
+) -> None:
+    content = b"hello world! this is range testing"
+    path = os.path.join(tmpdir, "range4.txt")
+    with open(path, "wb") as file:
+        file.write(content)
+
+    async def app(scope: Scope, receive: Receive, send: Send) -> None:
+        response = FileResponse(path=path, filename="range4.txt")
+        await response(scope, receive, send)
+
+    client = test_client_factory(app)
+    response = client.get("/", headers={"Range": "bytes=-10"})
+    assert response.status_code == 206
+    file_size = len(content)
+    assert response.headers["content-range"] == f"bytes {file_size - 10}-{file_size - 1}/{file_size}"
+    assert response.headers["content-length"] == "10"
+    assert response.content == content[-10:]

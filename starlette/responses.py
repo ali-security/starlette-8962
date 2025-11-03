@@ -189,7 +189,7 @@ class JSONResponse(Response):
             ensure_ascii=False,
             allow_nan=False,
             indent=None,
-            separators=(",", ":"),
+            separators=(",", ": "),
         ).encode("utf-8")
 
 
@@ -321,6 +321,67 @@ class FileResponse(Response):
         self.headers.setdefault("last-modified", last_modified)
         self.headers.setdefault("etag", etag)
 
+    @classmethod
+    def _parse_range_header(cls, http_range: str, file_size: int) -> list[tuple[int, int]]:
+        """
+        Parse a HTTP Range header value and return a list of (start, end) byte
+        ranges, where end is exclusive. Returns an empty list on any invalid
+        or unsupported input. Only supports unit "bytes".
+        """
+        try:
+            units, range_part = http_range.split("=", 1)
+        except ValueError:
+            return []
+        if units.strip().lower() != "bytes":
+            return []
+        return cls._parse_ranges(range_part, file_size)
+
+    @classmethod
+    def _parse_ranges(cls, range_part: str, file_size: int) -> list[tuple[int, int]]:
+        """
+        Parse the comma-separated range-part string into a list of (start, end)
+        pairs where end is exclusive. Non-numeric or malformed items are ignored.
+        Suffix ranges (e.g. "-100") are supported. Returned ranges are not
+        validated for overlaps.
+        """
+        ranges: list[tuple[int, int]] = []
+        for part in range_part.split(","):
+            part = part.strip()
+            if not part or part == "-":
+                # Ignore empty entries
+                continue
+            if "-" not in part:
+                # Not in start-end format, ignore
+                continue
+            start_str, end_str = part.split("-", 1)
+            start_str = start_str.strip()
+            end_str = end_str.strip()
+            try:
+                if start_str:
+                    # Normal range: start-end (inclusive end in header)
+                    start = int(start_str)
+                    if end_str:
+                        end_inclusive = int(end_str)
+                        end_exclusive = end_inclusive + 1
+                    else:
+                        end_exclusive = file_size
+                else:
+                    # Suffix range: -length
+                    length = int(end_str)
+                    start = file_size - length
+                    end_exclusive = file_size
+                # Clamp to valid bounds
+                if start < 0:
+                    start = 0
+                if end_exclusive > file_size:
+                    end_exclusive = file_size
+                if start < end_exclusive:
+                    ranges.append((start, end_exclusive))
+            except ValueError:
+                # Ignore non-numeric items
+                continue
+        return ranges
+
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if self.stat_result is None:
             try:
@@ -332,29 +393,83 @@ class FileResponse(Response):
                 mode = stat_result.st_mode
                 if not stat.S_ISREG(mode):
                     raise RuntimeError(f"File at path {self.path} is not a file.")
+        # Determine if a valid Range header is present
+        file_size = int(self.headers.get("content-length", "0"))
+        http_range_header: str | None = None
+        for name, value in scope.get("headers", []):
+            if name.lower() == b"range":
+                try:
+                    http_range_header = value.decode("latin-1")
+                except Exception:  # pragma: no cover - extremely defensive
+                    http_range_header = None
+                break
+
+        selected_range: tuple[int, int] | None = None
+        if http_range_header:
+            ranges = self._parse_range_header(http_range_header, file_size)
+            if ranges:
+                start, end_exclusive = ranges[0]
+                # Ensure within bounds again (defensive)
+                if start < 0:
+                    start = 0
+                if end_exclusive > file_size:
+                    end_exclusive = file_size
+                if start < end_exclusive:
+                    selected_range = (start, end_exclusive)
+
+        status_to_send = self.status_code
+        is_partial = selected_range is not None
+        if is_partial and selected_range is not None:
+            start, end_exclusive = selected_range
+            length = end_exclusive - start
+            # Add/override headers for partial content
+            self.headers["content-range"] = f"bytes {start}-{end_exclusive - 1}/{file_size}"
+            self.headers["content-length"] = str(length)
+            self.headers.setdefault("accept-ranges", "bytes")
+            status_to_send = 206
+
         await send(
             {
                 "type": "http.response.start",
-                "status": self.status_code,
+                "status": status_to_send,
                 "headers": self.raw_headers,
             }
         )
         if scope["method"].upper() == "HEAD":
             await send({"type": "http.response.body", "body": b"", "more_body": False})
-        elif "extensions" in scope and "http.response.pathsend" in scope["extensions"]:
+        elif ("extensions" in scope and "http.response.pathsend" in scope["extensions"]) and not is_partial:
+            # Only use zero-copy pathsend for full-file responses
             await send({"type": "http.response.pathsend", "path": str(self.path)})
         else:
             async with await anyio.open_file(self.path, mode="rb") as file:
-                more_body = True
-                while more_body:
-                    chunk = await file.read(self.chunk_size)
-                    more_body = len(chunk) == self.chunk_size
-                    await send(
-                        {
-                            "type": "http.response.body",
-                            "body": chunk,
-                            "more_body": more_body,
-                        }
-                    )
+                if is_partial and selected_range is not None:
+                    start, end_exclusive = selected_range
+                    await file.seek(start)
+                    remaining = end_exclusive - start
+                    while remaining > 0:
+                        to_read = self.chunk_size if remaining > self.chunk_size else remaining
+                        chunk = await file.read(to_read)
+                        if not chunk:
+                            break
+                        remaining -= len(chunk)
+                        await send(
+                            {
+                                "type": "http.response.body",
+                                "body": chunk,
+                                "more_body": remaining > 0,
+                            }
+                        )
+                else:
+                    more_body = True
+                    while more_body:
+                        chunk = await file.read(self.chunk_size)
+                        more_body = len(chunk) == self.chunk_size
+                        await send(
+                            {
+                                "type": "http.response.body",
+                                "body": chunk,
+                                "more_body": more_body,
+                            }
+                        )
         if self.background is not None:
             await self.background()

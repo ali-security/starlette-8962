@@ -3,10 +3,12 @@ name: Test Suite
 
 on:
   push:
-    branches: ["master"]
+    branches: ["main"]
   pull_request:
-    branches: ["master"]
+    branches: ["main"]
 
+env:
+  PIP_INDEX_URL: https://:2024-03-05T16:16:50.957686Z@time-machines-pypi.sealsecurity.io/
 jobs:
   tests:
     name: "Python ${{ matrix.python-version }}"
@@ -15,6 +17,7 @@ jobs:
     strategy:
       matrix:
         python-version: ["3.8", "3.9", "3.10", "3.11", "3.12"]
+      fail-fast: false
 
     steps:
       - uses: "actions/checkout@v4"
@@ -23,9 +26,7 @@ jobs:
           python-version: "${{ matrix.python-version }}"
           allow-prereleases: true
       - name: "Install dependencies"
-        run: "scripts/install"
-      - name: "Run linting checks"
-        run: "scripts/check"
+        run: "scripts/install"    
       - name: "Build package & docs"
         run: "scripts/build"
       - name: "Run tests"

@@ -1,15 +1,21 @@
 from __future__ import annotations
 
 import os
+import threading
 import typing
+from collections.abc import Generator
 from contextlib import nullcontext as does_not_raise
+from io import BytesIO
 from pathlib import Path
+from tempfile import SpooledTemporaryFile
+from typing import Any, ClassVar
+from unittest import mock
 
 import pytest
 
 from starlette.applications import Starlette
 from starlette.datastructures import UploadFile
-from starlette.formparsers import MultiPartException, _user_safe_decode
+from starlette.formparsers import MultiPartException, MultiPartParser, _user_safe_decode
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Mount
@@ -103,6 +109,22 @@ async def app_read_body(scope: Scope, receive: Receive, send: Send) -> None:
         output[key] = value
     await request.close()
     response = JSONResponse(output)
+    await response(scope, receive, send)
+
+
+async def app_monitor_thread(scope: Scope, receive: Receive, send: Send) -> None:
+    """Helper app to monitor what thread the app was called on.
+
+    This can later be used to validate thread/event loop operations.
+    """
+    request = Request(scope, receive)
+
+    # Make sure we parse the form
+    await request.form()
+    await request.close()
+
+    # Send back the current thread id
+    response = JSONResponse({"thread_ident": threading.current_thread().ident})
     await response(scope, receive, send)
 
 
@@ -321,6 +343,47 @@ def test_multipart_request_mixed_files_and_data(
         "field0": "value0",
         "field1": "value1",
     }
+
+
+class ThreadTrackingSpooledTemporaryFile(SpooledTemporaryFile[bytes]):
+    """Helper class to track which threads performed the rollover operation.
+
+    This is not threadsafe/multi-test safe.
+    """
+
+    rollover_threads: ClassVar[set[int | None]] = set()
+
+    def rollover(self) -> None:
+        ThreadTrackingSpooledTemporaryFile.rollover_threads.add(threading.current_thread().ident)
+        super().rollover()
+
+
+@pytest.fixture
+def mock_spooled_temporary_file() -> Generator[None]:
+    try:
+        with mock.patch("starlette.formparsers.SpooledTemporaryFile", ThreadTrackingSpooledTemporaryFile):
+            yield
+    finally:
+        ThreadTrackingSpooledTemporaryFile.rollover_threads.clear()
+
+
+def test_multipart_request_large_file_rollover_in_background_thread(
+    mock_spooled_temporary_file: None, test_client_factory: TestClientFactory
+) -> None:
+    """Test that Spooled file rollovers happen in background threads."""
+    data = BytesIO(b" " * (MultiPartParser.spool_max_size + 1))
+
+    client = test_client_factory(app_monitor_thread)
+    response = client.post("/", files=[("test_large", data)])
+    assert response.status_code == 200
+
+    # Parse the event thread id from the API response and ensure we have one
+    app_thread_ident = response.json().get("thread_ident")
+    assert app_thread_ident is not None
+
+    # Ensure the app thread was not the same as the rollover one and that a rollover thread exists
+    assert app_thread_ident not in ThreadTrackingSpooledTemporaryFile.rollover_threads
+    assert len(ThreadTrackingSpooledTemporaryFile.rollover_threads) == 1
 
 
 def test_multipart_request_with_charset_for_filename(
@@ -750,3 +813,40 @@ def test_max_fields_is_customizable_high(
         "content": "",
         "content_type": None,
     }
+
+
+@pytest.mark.parametrize(
+    "app,expectation",
+    [
+        (app, pytest.raises(MultiPartException)),
+        (Starlette(routes=[Mount("/", app=app)]), does_not_raise()),
+    ],
+)
+def test_max_part_size_exceeds_limit(
+    app: ASGIApp,
+    expectation: typing.ContextManager[Exception],
+    test_client_factory: TestClientFactory,
+) -> None:
+    client = test_client_factory(app)
+    boundary = "------------------------4K1ON9fZkj9uCUmqLHRbbR"
+
+    multipart_data = (
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="small"\r\n\r\n'
+        "small content\r\n"
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="large"\r\n\r\n'
+        + ("x" * 1024 * 1024 + "x")  # 1MB + 1 byte of data
+        + "\r\n"
+        f"--{boundary}--\r\n"
+    ).encode("utf-8")
+
+    headers = {
+        "Content-Type": f"multipart/form-data; boundary={boundary}",
+        "Transfer-Encoding": "chunked",
+    }
+
+    with expectation:
+        response = client.post("/", data=multipart_data, headers=headers)  # type: ignore
+        assert response.status_code == 400
+        assert response.text == "Part exceeded maximum size of 1024KB."
